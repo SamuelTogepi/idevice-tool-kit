@@ -1,590 +1,234 @@
-# Global vars.
-os="$(uname)"
-arch="$(uname -m)"
-device=
-# If false A10.
-a9=false
-ver=
-serial=
-not_normal=false
-ipsw_file=
-# Used to check if we need iOS 15 to be restored to get activation files, it doubles as a disable to prevent a recursive infinite loop when calling the restore_ipsw() func as well.
-restore_signed_ios=false
-# Need to do more steps for final restore.
-not_final_restore=true
+#!/bin/bash
 
-usbmuxd_restart() {
-    # Restart in normal non-pulling mode daemonized.
+# ============================================================
+# Samuel's iPad Downgrade: Core Logic & Device Toolkit
+# Description: Handles low-level device communication and exploits
+# ============================================================
+
+# Define Global Configuration
+SYS_OS="$(uname)"
+SYS_ARCH="$(uname -m)"
+IPAD_MODEL=""
+IS_A9_CHIP=false
+FIRMWARE_VER=""
+SERIAL_NUM=""
+IS_IN_RECOVERY=false
+TARGET_IPSW=""
+SIGNED_RESTORE_ACTIVE=false
+PRELIMINARY_PHASE=true
+
+# --- Daemon Management ---
+
+refresh_usbmux() {
+    # Resets the usbmuxd daemon to ensure clean communication
     killall usbmuxd > /dev/null 2>&1
     usbmuxd > /dev/null 2>&1
+    echo "Communication daemon (usbmuxd) has been refreshed."
 }
 
-update_existing_data() {
-    if [ -d "$1"/data ]; then
-        echo "Found existing data folder!"
-        cp -rv "$1"/data .
-        echo "Copied existing data folder!"
+# --- Data Management ---
+
+sync_existing_assets() {
+    local source_dir="$1"
+    if [[ -d "$source_dir/data" ]]; then
+        echo "Valid data directory located at $source_dir."
+        cp -rv "$source_dir/data" .
+        echo "Data migration successful."
     else
-        echo "Error: Could not find the data folder in $1!"
+        echo "Critical Error: Path '$source_dir' does not contain a data folder."
         exit 1
     fi
 
-    # Don't print error messages if no boot-* files exist.
-    cp -rv "$2"/boot-* . 2>/dev/null 
+    # Migrate any existing boot scripts without erroring if none exist
+    cp -rv "$source_dir"/boot-* . 2>/dev/null 
 }
 
-set_path() {
-    # OS/arch detection.
-    # Add all the self-contained binaries we need to the $PATH used within this script.
-    if [ "$os" = "Linux" ]; then
+# --- Environment Setup ---
 
-        if [ "$arch" = "x86_64" ]; then
-            PATH="${PATH:+$PATH:}$real_portable_folder/bin:$real_portable_folder/bin/Legacy-iOS-Kit/bin/linux/x86_64:$real_portable_folder/bin/turdus_m3rula_1.1_b0ea3ee7_linux-amd64/bin"
-        elif [ "$arch" = "arm64" ]; then
-            PATH="${PATH:+$PATH:}$real_portable_folder/bin:$real_portable_folder/bin/Legacy-iOS-Kit/bin/linux/arm64:$real_portable_folder/bin/turdus_m3rula_1.1_b0ea3ee7_linux-arm64/bin"
-        else
-            echo "Error: Linux on $arch is not supported."
-            exit 1
-        fi
+initialize_env() {
+    # Dynamically build the system PATH based on OS and Architecture
+    local bin_base="$real_portable_folder/bin"
+    local legacy_base="$bin_base/Legacy-iOS-Kit/bin"
+    local turdus_base=""
 
-        echo "Detected Linux on $arch."
-
-    elif [[ "$os" == "Darwin" ]]; then
-        PATH="${PATH:+$PATH:}$real_portable_folder/bin:$real_portable_folder/bin/Legacy-iOS-Kit/bin/macos:$real_portable_folder/bin/turdus_m3rula_1.1_b0ea3ee7_macos/bin"
-        echo "Detected Mac OS on $arch."
+    if [[ "$SYS_OS" == "Linux" ]]; then
+        case "$SYS_ARCH" in
+            "x86_64") turdus_base="$bin_base/turdus_m3rula_1.3_1fc7203b_linux-amd64/bin"
+                      PATH="${PATH:+$PATH:}$bin_base:$legacy_base/linux/x86_64:$turdus_base" ;;
+            "arm64")  turdus_base="$bin_base/turdus_m3rula_1.3_1fc7203b_linux-arm64/bin"
+                      PATH="${PATH:+$PATH:}$bin_base:$legacy_base/linux/arm64:$turdus_base" ;;
+            *) echo "Error: $SYS_ARCH architecture is not supported on Linux."; exit 1 ;;
+        esac
+    elif [[ "$SYS_OS" == "Darwin" ]]; then
+        turdus_base="$bin_base/turdus_m3rula_1.3_1fc7203b_macos/bin"
+        PATH="${PATH:+$PATH:}$bin_base:$legacy_base/macos:$turdus_base"
     else
-        echo "Error: $os is not supported."
+        echo "Error: Operating system $SYS_OS is unsupported."
         exit 1
     fi
-
-    echo "PATH: $PATH"    
 }
 
-startup() {
+setup_workspace() {
+    # Initialize directory structure
+    [[ ! -d "data" ]] && mkdir "data" && echo "Workspace initialized." || echo "Existing data found."
+    mkdir -p "data/ipsw."
 
-    if [ ! -d data ]; then
-        echo "Creating data folder..."
-        mkdir data
-    else
-        echo "Loaded existing data folder!"
+    # Permission checks for Linux
+    if [[ "$SYS_OS" == "Linux" ]]; then
+        [[ "$EUID" -ne 0 ]] && echo "Please run as root (sudo) on Linux." && exit 1
     fi
 
-    # Create ipsw directory if it does not exist.
-    mkdir -p data/ipsw
-
-    if [ "$os" = "Linux" ]; then
-        # On Linux we need root.
-        if [ "$EUID" -ne 0 ]; then
-            echo "Error: a999 must be ran with root privileges on Linux. Please execute it with sudo or as the root user to continue."
-            exit 1
-        fi
-    fi
-
-    if [ ! -f "bin/Legacy-iOS-Kit/resources/firstrun" ]; then
+    # Resource check for Legacy-iOS-Kit
+    if [[ ! -f "bin/Legacy-iOS-Kit/resources/firstrun" ]]; then
         (cd bin/Legacy-iOS-Kit && ./restore.sh --no-version-check --no-internet-check)
-        # This is to account for LibUSB being just installed.
-
-        if [ "$os" = "Linux" ]; then
+        
+        if [[ "$SYS_OS" == "Linux" ]]; then
             if command -v dnf >/dev/null; then
-                # More deps.
                 dnf install -y libimobiledevice libimobiledevice-utils expect idevicerestore irecovery
-                # Crypto libraries for lockdown.
                 update-crypto-policies --set LEGACY > /dev/null 2>&1
-                echo "Fedora users may need to reboot now before running a999 again! If it doesn't work, reboot and try again."
-
             elif command -v apt >/dev/null; then
-                apt install --yes expect libimobiledevice libimobiledevice-utils expect idevicerestore irecovery
+                apt update && apt install -y expect libimobiledevice libimobiledevice-utils idevicerestore irecovery
             fi
         fi
-
-        read -p "Please disconnect then reconnect your USB-A Lightning cable to ensure the iPhone can be detected.Then press any key to continue..."
+        echo "Dependencies installed. Reconnect your iPad and press Enter."
+        read -r
     fi
 
-    # Additional setup.
-    if [ "$os" = "Linux" ]; then
-        # https://github.com/alex-free/a999activator/issues/8#issuecomment-3383734504
-        if command -v dnf >/dev/null; then
-            # Crypto libraries for lockdown.
-            update-crypto-policies --set LEGACY > /dev/null 2>&1
-            # Crypto policies usually require a reboot to take effect but let's just be thorough here...
-            # Set SE linux to permissive (resets on Reboot)
-            setenforce 0
-        fi
-    elif [ "$os" = "Darwin" ]; then
-        # All these executables are signed so that is the only think preventing gatekeeper from allowing the script to be automatic is the quarintine attributes.
-        # Remove any quarintine attributes in this folder.
-        xattr -rc .
-    else
-        echo "Error: unsupported operating system!"
-        exit 1
+    # Security policy adjustments
+    if [[ "$SYS_OS" == "Linux" && -x "$(command -v dnf)" ]]; then
+        update_crypto_policies --set LEGACY > /dev/null 2>&1
+        setenforce 0 2>/dev/null
+    elif [[ "$SYS_OS" == "Darwin" ]]; then
+        xattr -rc . # Clear macOS quarantine flags
     fi
 }
 
-generate_boot_script(){
-    boot_script=boot_"$device"_"$ver"_"$serial"
+# --- Boot Management ---
 
-    # Delete any existing boot* scripts for this serial number.
-    rm -f *-$serial
-    
-    if [ "$a9" = "true" ]; then
-        echo -e '#!/bin/bash
+write_tether_boot_script() {
+    local script_name="boot_${IPAD_MODEL}_${FIRMWARE_VER}_${SERIAL_NUM}"
+    rm -f *-"$SERIAL_NUM" # Clean old scripts for this specific device
 
-real_portable_folder="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$real_portable_folder"
-os="$(uname)"
-arch="$(uname -m)"
-
-# OS/arch detection.
-# Add all the self-contained binaries we need to the $PATH used within this script.
-if [ "$os" = "Linux" ]; then
-
-    if [ "$arch" = "x86_64" ]; then
-        PATH="${PATH:+$PATH:}$real_portable_folder/bin:$real_portable_folder/bin/Legacy-iOS-Kit/bin/linux/x86_64:$real_portable_folder/bin/turdus_m3rula_1.1_b0ea3ee7_linux-amd64/bin"
-    elif [ "$arch" = "arm64" ]; then
-        PATH="${PATH:+$PATH:}$real_portable_folder/bin:$real_portable_folder/bin/Legacy-iOS-Kit/bin/linux/arm64:$real_portable_folder/bin/turdus_m3rula_1.1_b0ea3ee7_linux-arm64/bin"
+    local payload=""
+    if [[ "$IS_A9_CHIP" == "true" ]]; then
+        # A9 logic: PTEblock boot
+        payload='while irecovery -m 2>/dev/null | grep -q "Recovery Mode"; do
+            until turdusra1n -TP data/'$IPAD_MODEL'_'$SERIAL_NUM'/'$FIRMWARE_VER'/block/*-pteblock2.bin; do 
+                echo "Retrying exploit..."
+            done
+            sleep 20
+        done'
     else
-        echo "Error: Linux on $arch is not supported."
-        exit 1
+        # A10 logic: SEP/iBoot image4 boot
+        payload='while irecovery -m 2>/dev/null | grep -q "Recovery Mode"; do
+            until turdusra1n -t data/'$IPAD_MODEL'_'$SERIAL_NUM'/'$FIRMWARE_VER'/image4/*iBoot.img4 -i data/'$IPAD_MODEL'_'$SERIAL_NUM'/'$FIRMWARE_VER'/image4/*signed-SEP.img4 -p data/'$IPAD_MODEL'_'$SERIAL_NUM'/'$FIRMWARE_VER'/image4/*SEP.im4p; do
+                echo "Retrying exploit..."
+            done
+            sleep 20
+        done'
     fi
 
-    echo "Detected Linux on $arch."
-
-elif [ "$os" == "Darwin" ]; then
-    PATH="${PATH:+$PATH:}$real_portable_folder/bin:$real_portable_folder/bin/Legacy-iOS-Kit/bin/macos:$real_portable_folder/bin/turdus_m3rula_1.1_b0ea3ee7_macos/bin"
-    echo "Detected Mac OS on $arch."
-else
-    echo "Error: $os is not supported."
-    exit 1
-fi
-
-echo "PATH: $PATH"   
-
-if [ "$os" = "Linux" ]; then
-
-    if [ "$EUID" -ne 0 ]; then
-        echo "Error: root privileges are required to boot your iPhone. Please execute $0 with sudo or as root to continue." >&2
-        exit 1
-    fi
-
-    usbmuxd_restart_polling > /dev/null 2>&1
-fi
-
-# Can not trust return values of turdusra1n because at least my 128GB TSMC 6S Plus reboots to recovery very occasionally. This has never happened on my 32GB TSMC 6S Plus.
-while irecovery -m 2>/dev/null | grep -q "Recovery Mode"; do
-    echo "If you get an error about failed to open handle (no device) after Checkmate?, disconnect then reconnect your iPhone."
-
-    while ! turdusra1n -TP data/'$device'_'$serial'/'$ver'/block/*-pteblock2.bin; do 
-        echo "Something went wrong, lets try that again..."
-    done
-
-    echo "Please wait, checking for proper booting in 20 seconds"
-    sleep 20
-done
-
-# Restart in normal non-pulling mode daemonized.
-killall usbmuxd > /dev/null 2>&1
-usbmuxd
-echo "Done!"
-
-' > $boot_script
-
-    #A10.
-    else
-        echo -e '#!/bin/bash
-
-real_portable_folder="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$real_portable_folder"
-os="$(uname)"
-arch="$(uname -m)"
-
-# OS/arch detection.
-# Add all the self-contained binaries we need to the $PATH used within this script.
-if [ "$os" = "Linux" ]; then
-
-    if [ "$arch" = "x86_64" ]; then
-        PATH="${PATH:+$PATH:}$real_portable_folder/bin:$real_portable_folder/bin/Legacy-iOS-Kit/bin/linux/x86_64:$real_portable_folder/bin/turdus_m3rula_1.1_b0ea3ee7_linux-amd64/bin"
-    elif [ "$arch" = "arm64" ]; then
-        PATH="${PATH:+$PATH:}$real_portable_folder/bin:$real_portable_folder/bin/Legacy-iOS-Kit/bin/linux/arm64:$real_portable_folder/bin/turdus_m3rula_1.1_b0ea3ee7_linux-arm64/bin"
-    else
-        echo "Error: Linux on $arch is not supported."
-        exit 1
-    fi
-
-    echo "Detected Linux on $arch."
-
-elif [ "$os" == "Darwin" ]; then
-    PATH="${PATH:+$PATH:}$real_portable_folder/bin:$real_portable_folder/bin/Legacy-iOS-Kit/bin/macos:$real_portable_folder/bin/turdus_m3rula_1.1_b0ea3ee7_macos/bin"
-    echo "Detected Mac OS on $arch."
-else
-    echo "Error: $os is not supported."
-    exit 1
-fi
-
-echo "PATH: $PATH"   
-
-if [ "$os" = "Linux" ]; then
-
-    if [ "$EUID" -ne 0 ]; then
-        echo "Error: root privileges are required to boot your iPhone. Please execute $0 with sudo or as root to continue." >&2
-        exit 1
-    fi
-
-    usbmuxd_restart_polling > /dev/null 2>&1
-fi
-
-# Can not trust return values of turdusra1n because at least my 128GB TSMC 6S Plus reboots to recovery very occasionally. This has never happened on my 32GB TSMC 6S Plus.
-while irecovery -m 2>/dev/null | grep -q "Recovery Mode"; do
-
-    while ! turdusra1n -t data/'$device'_'$serial'/'$ver'/image4/*'$boot_script_ver'-iBoot.img4 -i data/'$device'_'$serial'/'$ver'/image4/*signed-SEP.img4 -p data/'$device'_'$serial'/'$ver'/image4/*'$boot_script_ver'-SEP.im4p; do
-        echo "Something went wrong, lets try that again..."
-    done
-
-    echo "Please wait, checking for proper booting in 20 seconds"
-    sleep 20
-done
-
-# Restart in normal non-pulling mode daemonized.
-killall usbmuxd > /dev/null 2>&1
-usbmuxd
-echo "Done!"
-
-' > $boot_script
-
-    fi
-
-    chmod 755 $boot_script
-    # Clips the last character otherwise in the echo below.
-    boot_script=$(echo "$boot_script" | tr -d '\r')
-    echo "If your phone is powered off or rebooted, it will first boot to Recovery Mode. You'll need to run the new $boot_script command to boot it into normal mode."
+    # Wrap payload in script boilerplate
+    echo -e "#!/bin/bash\n# Samuel's iPad Bootstrapper\n$(declare -f initialize_env)\ninitialize_env\n$payload\nrefresh_usbmux\necho 'Boot Complete.'" > "$script_name"
+    chmod +x "$script_name"
+    echo "Generated boot script: $script_name."
 }
 
-pair_iphone(){
-    idevicepair pair >/dev/null 2>&1
-}
+# --- Device Detection ---
 
-detect_iphone() {
-    # Start usbmuxd in foreground using polling option.
-    if [ "$os" = "Linux" ]; then
-        usbmuxd_restart_polling > /dev/null 2>&1
-    fi
+identify_connected_device() {
+    echo "Scanning for A9/A10 iPad..."
 
-    echo "Searching for an iPhone connected to this computer with a USB-A Lightning cable. Please wait..."
-
-    # Need the serial number to identify what cached data to use. This is available in Recovery Mode and Normal mode, but not in DFU Mode so we don't allow this to run until we get into Recovery Mode if DFU Mode is detected.
-    echo "Checking for iPhone in DFU Mode..."
-
+    # Block until device leaves DFU if necessary
     if irecovery -m 2>/dev/null | grep -q "DFU Mode"; then
-        wait_for_recovery
+        echo "Detected DFU state. Moving to recovery handler..."
+        await_recovery_mode
     fi
 
-    # Loop until the iPhone can be detected in Recovery Mode or Normal Mode. It sure as hell aint in DFU Mode at this point...
     while true; do
-
-        echo "Checking for iPhone in Recovery Mode..."
-
         if irecovery -m 2>/dev/null | grep -q "Recovery Mode"; then
-            echo "Info: iPhone was found in Recovery Mode."
-            not_normal=true
-            serial=$(irecovery -q 2>/dev/null | grep -i 'SRNM:' | awk '{print $2}')
-
-            if irecovery -q 2>/dev/null |  grep '^PRODUCT: iPhone8,1'; then
-                echo "iPhone 6S detected!"
-                device=iphone_6s
-
-            elif irecovery -q 2>/dev/null | grep -q '^PRODUCT: iPhone8,2'; then
-                echo "iPhone 6S Plus detected!"
-                device=iphone_6s_plus
+            echo "Device found in Recovery Mode."
+            IS_IN_RECOVERY=true
+            SERIAL_NUM=$(irecovery -q 2>/dev/null | grep 'SRNM:' | cut -d ' ' -f2)
+            local product=$(irecovery -q 2>/dev/null | grep 'PRODUCT:' | cut -d ' ' -f2)
             
-            elif irecovery -q 2>/dev/null | grep -q '^PRODUCT: iPhone8,4'; then
-                echo "iPhone SE detected!"
-                device=iphone_se
+            case "$product" in
+                "iPad6,11"|"iPad6,12") IPAD_MODEL="ipad_5" ;;
+                "iPad7,5"|"iPad7,6")   IPAD_MODEL="ipad_6" ;;
+                "iPad6,7"|"iPad6,8")   IPAD_MODEL="ipad_pro_129_1" ;;
+                "iPad6,3"|"iPad6,4")   IPAD_MODEL="ipad_pro_97" ;;
+                "iPad7,3"|"iPad7,4")   IPAD_MODEL="ipad_pro_105" ;;
+                "iPad7,1"|"iPad7,2")   IPAD_MODEL="ipad_pro_129_2" ;;
+                *) echo "Incompatible device: $product"; exit 1 ;;
+            esac
             
-            elif irecovery -q 2>/dev/null | grep '^PRODUCT: iPhone9,1'; then
-                echo "iPhone 7 detected!"
-                device=iphone_7
-                break
-            elif irecovery -q 2>/dev/null | grep '^PRODUCT: iPhone9,3'; then
-                echo "iPhone 7 detected!"
-                device=iphone_7
-                break
-            
-            elif irecovery -q 2>/dev/null | grep -q '^PRODUCT: iPhone9,2'; then
-                echo "iPhone 7 Plus detected!"
-                device=iphone_7_plus
-                break
-            elif irecovery -q 2>/dev/null | grep -q '^PRODUCT: iPhone9,4'; then
-                echo "iPhone 7 Plus detected!"
-                device=iphone_7_plus
-                break
-            else
-                echo "Error: could not find a supported iPhone. If you have a supported iPhone, make sure it is connected with a Lightning to USB-A cable to this computer and try again."
-                exit 1
-            fi
-
-            if irecovery -q 2>/dev/null | grep -q '^CPID: 0x8003'; then
-                echo "Info: TSMC A9 chip detected!"
-                break
-            elif irecovery -q 2>/dev/null | grep -q '^CPID: 0x8001'; then
-                echo "Info: Samsung A9X chip detected! You must have an iPad Pro!"
-                break
-            elif irecovery -q 2>/dev/null | grep -q '^CPID: 0x8000'; then
-                echo "Info: Samsung A9 chip detected!"
-                break
-            fi
-
+            # Check Chip ID
+            local cpid=$(irecovery -q 2>/dev/null | grep 'CPID:' | cut -d ' ' -f2)
+            [[ "$cpid" == "0x8003" || "$cpid" == "0x8000" ]] && IS_A9_CHIP=true
+            break
         else
-            # Gets here if no iPhone is connected as well so set special arg.
-            echo "Checking for iPhone in Normal Mode..."
-            pair_iphone
-            serial=$(ideviceinfo 2>/dev/null | grep -i '^SerialNumber:' | awk '{print $2}')
+            # Try Normal Mode
+            idevicepair pair >/dev/null 2>&1
+            SERIAL_NUM=$(ideviceinfo -k SerialNumber 2>/dev/null)
+            [[ -z "$SERIAL_NUM" ]] && sleep 2 && continue
             
-            if ideviceinfo 2>/dev/null | grep -q '^ProductType: iPhone8,1' > /dev/null 2>&1; then
-                echo "iPhone 6S detected!"
-                device=iphone_6s
-            
-            elif ideviceinfo 2>/dev/null | grep -q '^ProductType: iPhone8,2' > /dev/null 2>&1; then
-                echo "iPhone 6S Plus detected!"
-                device=iphone_6s_plus
-            
-            elif ideviceinfo 2>/dev/null | grep -q '^ProductType: iPhone8,4' > /dev/null 2>&1; then
-                echo "iPhone SE detected!"
-                device=iphone_se
-
-            elif ideviceinfo 2>/dev/null | grep -q '^ProductType: iPhone9,1' > /dev/null 2>&1; then
-                echo "iPhone 7 detected!"
-                device=iphone_7
-                break
-            elif ideviceinfo 2>/dev/null | grep -q '^ProductType: iPhone9,3' > /dev/null 2>&1; then
-                echo "iPhone 7 detected!"
-                device=iphone_7
-                break
-
-            elif ideviceinfo 2>/dev/null | grep -q '^ProductType: iPhone9,2' > /dev/null 2>&1; then
-                echo "iPhone 7 Plus detected!"
-                device=iphone_7_plus
-                break
-            elif ideviceinfo 2>/dev/null | grep -q '^ProductType: iPhone9,4' > /dev/null 2>&1; then
-                echo "iPhone 7 Plus detected!"
-                device=iphone_7_plus
-                break
-
-            else
-                echo "Error: could not find a supported iPhone. If you have a supported iPhone, make sure it is connected with a Lightning to USB-A cable to this computer and try again. If it is in Normal mode, it needs to be trusted to this computer to be detected."
-                exit 1
-            fi
-
-            if ideviceinfo 2>/dev/null |  grep -q '^HardwarePlatform: s8003'; then
-                echo "Info: TSMC A9 chip detected!"
-                break
-            elif ideviceinfo 2>/dev/null |  grep -q '^HardwarePlatform: s8001'; then
-                echo "Info: Samsung A9X chip detected! You must have an iPad Pro!"
-                break
-            elif ideviceinfo 2>/dev/null |  grep -q '^HardwarePlatform: s8000'; then
-                echo "Info: Samsung A9 chip detected!"
-                break
-            fi
+            local type=$(ideviceinfo -k ProductType 2>/dev/null)
+            case "$type" in
+                "iPad6,11"|"iPad6,12") IPAD_MODEL="ipad_5" ;;
+                "iPad7,5"|"iPad7,6")   IPAD_MODEL="ipad_6" ;;
+                *) echo "Standard mode detection for $type failed. Put device in Recovery."; exit 1 ;;
+            esac
+            break
         fi
     done
-
-    if [ "$device" = "iphone_6s" ] || [ "$device" = "iphone_6s_plus" ] || [ "$device" = "iphone_se" ]; then
-        a9=true
-    fi
-
-    echo "Serial Number Identifier: $serial"
+    echo "Detected: $IPAD_MODEL | Serial: $SERIAL_NUM | A9: $IS_A9_CHIP"
 }
 
-# Note: this only does so much because it appears that if the iPhone was in DFU Mode and then exited it will auto-boot=true.
-enforce_recovery() {
-    irecovery -c "setenv auto-boot false"
-    irecovery -c "saveenv"
-}
+# --- Restore Logic ---
 
-boot_turdusra1n() {
-    wait_for_recovery
-
-    # Can not trust return values of turdusra1n because at least my 128GB TSMC 6S Plus reboots to recovery very occasionally. This has never happened on my 32GB TSMC 6S Plus. It appears to be an issue with turdus merula because it won't show as much output (never gets to bootx) but still returns 0.
-    while irecovery -m 2>/dev/null | grep -q "Recovery Mode"; do
-        echo "Info: If you get an error about failed to open handle (no device) after Checkmate?, disconnect then reconnect your iPhone."
-        
-        if [ "$a9" = "true" ]; then
-        
-            while ! turdusra1n -TP data/"$device"_"$serial"/$ver/block/*-pteblock2.bin; do
-                echo "Something went wrong, lets try that again."
-            done
-        else
-            while ! turdusra1n -t data/"$device"_"$serial"/$ver/image4/*iBoot.img4 -i data/"$device"_"$serial"/$ver/image4/*signed-SEP.img4 -p data/"$device"_"$serial"/$ver/image4/*-SEP.im4p; do
-                echo "Something went wrong, lets try that again."
-            done
-        fi
-        # Give time to exit Recovery Mode so this is not executed again erronously.
-        echo "Please wait, checking for proper booting in 20 seconds"
-        sleep 20
-    done
-}
-
-enter_recovery() {    
-    if ! irecovery -m 2>/dev/null | grep -q "Recovery Mode"; then
-        # If not in Recovery Mode assume in Normal Mode and attempt to enter Recovery Mode. If this fails we are already in Recovery Mode or possibly DFU Mode so we don't want to show an error."
-        if ideviceenterrecovery "$(ideviceinfo -k UniqueDeviceID 2>/dev/null)" >/dev/null 2>&1; then
-            # If this succeded lets tell the user what's going on. If it didn't succed then that's ok we don't need to tell them anything due to the above reasoning....
-            echo "Entering Recovery Mode, please wait..."
-        fi
-        
-        # If this was DFU Mode this is fine to show the user because it gets them back on track...
-        wait_for_recovery
-    fi
-}
-
-wait_for_normal_mode() {
-    echo "Waiting for iPhone to boot into Normal Mode..."
-
-    while ! ideviceinfo 2>/dev/null; do
-       # Ensure we are paired.
-        pair_iphone
-        sleep 1
-    done
-}
-
-wait_for_recovery() {
-    echo "Expecting iPhone to be in Recovery Mode shortly, hang in there!"
-
-     while ! irecovery -m 2>/dev/null | grep -q "Recovery Mode"; do
-
-        if irecovery -m 2>/dev/null | grep -q "DFU Mode"; then
-            if [ "$a9" = "true" ]; then
-                echo "DFU Mode detected. Please press the HOME+POWER buttons until your iPhone reboots into Recovery Mode. Do not stop pressing those buttons until you get to Recovery Mode."
-            else
-                echo "DFU Mode detected. Please press the volume down+POWER buttons until your iPhone reboots into Recovery Mode. Do not stop pressing those buttons until you get to Recovery Mode."
-            fi
-
-            while irecovery -m 2>/dev/null | grep -q "DFU Mode"; do
-                sleep 1
-            done
-
-        fi
-
-        sleep 1
-    done
+execute_restore() {
+    local target_ipsw="$1"
+    parse_firmware_details "$target_ipsw"
     
-    echo "Found iPhone in Recovery Mode!"
+    echo "Initiating restore for $FIRMWARE_VER..."
+    local work_dir="data/${IPAD_MODEL}_${SERIAL_NUM}/${FIRMWARE_VER}"
+    mkdir -p "$work_dir"
+
+    if [[ "$IS_A9_CHIP" == "true" ]]; then
+        # A9 Restore Cycle (SHC/PTE Blocks)
+        while ! find "$work_dir/block" -name "*restore-shcblock2.bin" | grep -q .; do
+            trigger_exploit
+            turdus_merula -C "$work_dir" --get-shcblock "$target_ipsw" || continue
+            await_recovery_mode
+        done
+
+        trigger_exploit
+        turdus_merula -C "$work_dir" -o --load-shcblock "$work_dir"/block/*-restore-shcblock2.bin "$target_ipsw"
+    else
+        # A10 Restore Cycle
+        trigger_exploit
+        turdus_merula -C "$work_dir" -o "$target_ipsw"
+    fi
 }
 
-turdursra1n_pwn() {
-    wait_for_recovery
+# --- Helper Utilities ---
 
-    while ! turdusra1n -D; do
-        echo "Something went wrong. Lets try that again..."
+await_recovery_mode() {
+    until irecovery -m 2>/dev/null | grep -q "Recovery Mode"; do
+        if irecovery -m 2>/dev/null | grep -q "DFU Mode"; then
+            echo "Manually exit DFU Mode using the button combination for your iPad model."
+        fi
         sleep 1
     done
 }
 
-retry_pwn() {
-    echo "Something went wrong, lets try that again."
-    turdursra1n_pwn
+trigger_exploit() {
+    until turdusra1n -D; do
+        echo "Exploit failed. Re-attempting..."
+        sleep 1
+    done
 }
 
-get_ver() {
-    # If given URL, using a999activator setup with hardcoded URLs.
-    if [[ "$1" == http://* || "$1" == https://* ]]; then
-        mkdir -p data/ipsw
-        # Check that we have ipsw file.
-        ipsw_file="data/ipsw/$(basename "$1")"
-
-        if [ ! -f $ipsw_file ]; then
-            echo "Downloading $ipsw_file..."
-            
-            while ! curl -L $1 -o $ipsw_file; do
-                echo "Download failed, trying again."
-                rm -f $ipsw_file
-            done
-        fi
-    elif [ -f "$1" ]; then
-        ipsw_file="$1"
-    fi
-
-    # Get ver and build number, i.e. 9.2_13D20 for possible iPhone 6S downgrade (even though we can't use 13D20 or any 'new' iOS 9.2.1 for other devices because jbme does not work)... Build number is important for iPhone 6S and iPhone 6S Plus which have 2 different iOS 9.2.1 versions available for restore.
-    ver=$(echo "$ipsw_file" | sed -E 's/.*_(.*_.*)_Restore\.ipsw/\1/')
-        
-    # Only iOS version number, needed for A10 boot script.
-    if [ "$a9" = "false" ]; then
-        boot_script_ver=$(echo "$ipsw_file" | sed -E 's/.*_(.*)_(.*)_Restore\.ipsw/\1/')
-    fi
-}
-
-restore_ipsw() {
-    enter_recovery
-    enforce_recovery
-
-    get_ver "$1"
-
-    echo "Restoring iOS $ver with $ipsw_file.."
-
-    mkdir -p data/"$device"_"$serial"/$ver 
-
-    if [ "$a9" = "true" ]; then
-        #SHCblock.
-        # BUG (in turdus_merula since v1.1). This can exit ok but it really didn't get the PTE block so we need to check again even after it returns 0. This is done for SHCBlock just in case the same could happen (trust issues since PTEBlock surfaced).
-        while ! find data/"$device"_"$serial"/$ver/block -type f -name "*restore-shcblock2.bin" 2>/dev/null | grep -q . 2>/dev/null; do
-            echo "Getting restore SHCBlock..."
-            turdursra1n_pwn
-
-            while ! echo 1 | turdus_merula -C data/"$device"_"$serial"/$ver --get-shcblock $ipsw_file; do
-                retry_pwn
-            done
-
-            wait_for_recovery
-            enforce_recovery
-        done
-
-        echo "Restoring..."
-        # Restore.
-        turdursra1n_pwn
-
-        while ! echo 1 | turdus_merula -C data/"$device"_"$serial"/$ver -o --load-shcblock data/"$device"_"$serial"/$ver/block/*-restore-shcblock2.bin $ipsw_file; do
-            retry_pwn
-        done
-
-        # Skip the rest if signed ios ver or if intermediete restore (i.e. 10.3.3 before 10.0-10.3.2, or 10.2.1 before 9.x).
-        if [ "$not_final_restore" = "true" ]; then
-            return
-        fi
-
-        while ! find data/"$device"_"$serial"/$ver/block -type f -name "*-current-shcblock2.bin" 2>/dev/null | grep -q . 2>/dev/null; do
-            echo "Getting post-restore SHCBlock..."
-            cd data/"$device"_"$serial"/$ver
-            mkdir -p block
-
-            while ! turdusra1n -g $ipsw_file; do
-                echo "Something went wrong, let's try that again..."
-            done
-
-            cd ../../../
-
-            wait_for_recovery
-            enforce_recovery
-        done
-
-        # Get PTEBlock.
-        while ! find data/"$device"_"$serial"/$ver/block -type f -name "*-pteblock2.bin" 2>/dev/null | grep -q . 2>/dev/null; do
-            echo "Getting PTEBlock..."
-            cd data/"$device"_"$serial"/$ver
-            mkdir -p block
-            
-            while ! turdusra1n -g -i image4/*signed-SEP.img4 -C block/*-current-shcblock2.bin $ipsw_file; do
-                echo "Something went wrong, let's try that again..."
-            done
-
-            cd ../../../
-            wait_for_recovery
-            enforce_recovery
-        done
-    else
-        echo "Restoring..."
-        # Restore.
-        turdursra1n_pwn
-
-        while ! echo 1 | turdus_merula -C data/"$device"_"$serial"/$ver -o $ipsw_file; do
-            retry_pwn
-        done
-    fi
+parse_firmware_details() {
+    FIRMWARE_VER=$(echo "$1" | sed -E 's/.*_(.*_.*)_Restore\.ipsw/\1/')
 }
